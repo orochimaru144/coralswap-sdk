@@ -9,12 +9,13 @@ import {
 } from "@/types/fee";
 import { FeeState } from "@/types/pool";
 import { FeeEstimates } from "@/types/fee-estimates";
-import { estimateGas } from "@/utils/gas";
+import { estimateGas, formatStroopsAsXLM } from "@/utils/gas";
 import { validateAddress, validatePositiveAmount } from "@/utils/validation";
 import { ledgerToApproxTime, LedgerHead } from "@/utils/ledger";
 import { TypedEventCursor, MIN_START_LEDGER, MAX_EVENT_LIMIT } from "@/utils/event-cursor";
 import { SwapEvent } from "@/types/events";
 import { decodeU32 } from "@/utils/scval";
+import { getTokenDecimals, FALLBACK_TOKEN_DECIMALS } from "@/utils/token-decimals";
 import { ValidationError } from "@/errors";
 
 /**
@@ -421,22 +422,22 @@ export class FeeModule {
     const ledger = await this.client.getCurrentLedger();
 
     let protocolFeeBps = 0;
-    let protocolFeeStroops = 0;
+    let protocolFeeStroops = 0n;
 
     try {
       const pairAddress = this.extractPairAddress(operations);
       if (pairAddress) {
         const feeState = await this.getFeeState(pairAddress);
         protocolFeeBps = feeState.feeCurrent || 0;
-        protocolFeeStroops = Math.floor(gasEstimate.fee * (protocolFeeBps / 10000));
+        protocolFeeStroops = (gasEstimate.fee * BigInt(Math.trunc(protocolFeeBps))) / 10000n;
       }
     } catch {
       protocolFeeBps = 0;
-      protocolFeeStroops = 0;
+      protocolFeeStroops = 0n;
     }
 
     const totalStroops = gasEstimate.fee + protocolFeeStroops;
-    const totalXLM = `${(totalStroops / 10000000).toFixed(5)} XLM`;
+    const totalXLM = formatStroopsAsXLM(totalStroops);
 
     const breakdown = {
       gas: {
@@ -446,7 +447,7 @@ export class FeeModule {
       protocol: {
         bps: protocolFeeBps,
         stroops: protocolFeeStroops,
-        xlm: `${(protocolFeeStroops / 10000000).toFixed(5)} XLM`,
+        xlm: formatStroopsAsXLM(protocolFeeStroops),
       },
     };
 
@@ -495,17 +496,23 @@ export class FeeModule {
     const cached = this.decimalsCache.get(tokenAddress);
     if (cached !== undefined) return cached;
 
+    let decimals: number | undefined;
     try {
-      const op = new Contract(tokenAddress).call("decimals");
-      const result = await this.simulateTokenRead(op);
-      const decimals = result ? decodeU32(result) : 7;
-      const safe = Number.isInteger(decimals) && decimals >= 0 && decimals <= 18 ? decimals : 7;
-      this.decimalsCache.set(tokenAddress, safe);
-      return safe;
+      const result = await this.simulateTokenRead(new Contract(tokenAddress).call("decimals"));
+      if (result) decimals = decodeU32(result);
     } catch {
-      this.decimalsCache.set(tokenAddress, 7);
-      return 7;
+      // Simulation unavailable: fall through to the token metadata read.
     }
+    if (decimals === undefined) {
+      decimals = await getTokenDecimals(this.client, tokenAddress);
+    }
+
+    const safe =
+      Number.isInteger(decimals) && decimals >= 0 && decimals <= 18
+        ? decimals
+        : FALLBACK_TOKEN_DECIMALS;
+    this.decimalsCache.set(tokenAddress, safe);
+    return safe;
   }
 
   /**
